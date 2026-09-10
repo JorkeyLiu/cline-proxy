@@ -155,12 +155,12 @@ func responsesToolsToChat(tools []any) []any {
 // chatToResponses chat.completions 响应 -> Responses 响应
 func chatToResponses(chat map[string]any) map[string]any {
 	resp := map[string]any{
-		"id":         "resp_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
-		"object":     "response",
-		"created_at": time.Now().Unix(),
-		"status":     "completed",
-		"model":      chat["model"],
-		"output":     []any{},
+		"id":          "resp_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
+		"object":      "response",
+		"created_at":  time.Now().Unix(),
+		"status":      "completed",
+		"model":       chat["model"],
+		"output":      []any{},
 		"output_text": "",
 	}
 	choices, _ := chat["choices"].([]any)
@@ -178,11 +178,11 @@ func chatToResponses(chat map[string]any) map[string]any {
 				content = append(content, map[string]any{"type": "output_text", "text": c, "annotations": []any{}})
 			}
 			msgOut := map[string]any{
-				"type":      "message",
-				"id":        "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
-				"status":    "completed",
-				"role":      "assistant",
-				"content":   content,
+				"type":        "message",
+				"id":          "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
+				"status":      "completed",
+				"role":        "assistant",
+				"content":     content,
 				"output_text": outputText.String(),
 			}
 			outputs = append(outputs, msgOut)
@@ -215,6 +215,17 @@ func chatToResponses(chat map[string]any) map[string]any {
 				}
 			}
 		}
+	}
+	// 始终含一个 message output：空文本/无 choices 时 content 可为空、output_text 为 ""。
+	if len(outputs) == 0 {
+		outputs = append(outputs, map[string]any{
+			"type":        "message",
+			"id":          "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli()),
+			"status":      "completed",
+			"role":        "assistant",
+			"content":     []any{},
+			"output_text": "",
+		})
 	}
 	resp["output"] = outputs
 	resp["output_text"] = outputText.String()
@@ -279,9 +290,30 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 	s.event("response.in_progress", map[string]any{"type": "response.in_progress", "response": map[string]any{"id": s.respID}})
 
 	textEmitted := false
-	callEmitted := false
-	var curCallID, curCallName string
-	var curArgs strings.Builder
+	type respToolCall struct {
+		idx         int
+		callID      string
+		name        string
+		args        strings.Builder
+		added       bool
+		fcID        string
+		outputIndex int
+	}
+	toolByIndex := map[int]*respToolCall{}
+	var toolOrder []*respToolCall
+	respFCID := func(tc *respToolCall) string {
+		if tc.fcID != "" {
+			return tc.fcID
+		}
+		if tc.name != "" {
+			tc.fcID = "fc_" + tc.name
+		} else if tc.callID != "" {
+			tc.fcID = "fc_" + tc.callID
+		} else {
+			tc.fcID = "fc_unknown"
+		}
+		return tc.fcID
+	}
 	var outText strings.Builder
 
 	reader := bufio.NewReader(upstream.Body)
@@ -319,78 +351,97 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 				if ch == nil {
 					continue
 				}
-				delta, _ := ch["delta"].(map[string]any)
-				if delta == nil {
-					delta = ch
-				}
+				delta := streamDeltaFromChoice(ch)
 				// 文本
 				if c, ok := delta["content"].(string); ok && c != "" {
 					if !textEmitted {
 						textEmitted = true
 						s.event("response.output_item.added", map[string]any{
-							"type":       "response.output_item.added",
+							"type":         "response.output_item.added",
 							"output_index": 0,
-							"item": map[string]any{"id": s.msgID, "type": "message", "role": "assistant", "status": "in_progress", "content": []any{}},
+							"item":         map[string]any{"id": s.msgID, "type": "message", "role": "assistant", "status": "in_progress", "content": []any{}},
 						})
 						s.event("response.content_part.added", map[string]any{
-							"type": "response.content_part.added",
-							"item_id": s.msgID,
-							"output_index": 0,
+							"type":          "response.content_part.added",
+							"item_id":       s.msgID,
+							"output_index":  0,
 							"content_index": 0,
-							"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+							"part":          map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
 						})
 					}
 					outText.WriteString(c)
 					s.event("response.output_text.delta", map[string]any{
-						"type": "response.output_text.delta",
-						"item_id": s.msgID,
-						"output_index": 0,
+						"type":          "response.output_text.delta",
+						"item_id":       s.msgID,
+						"output_index":  0,
 						"content_index": 0,
-						"delta": c,
+						"delta":         c,
 					})
 				}
 				// 推理
 				if r, ok := delta["reasoning_content"].(string); ok && r != "" {
 					s.event("response.reasoning_summary_text.delta", map[string]any{
-						"type": "response.reasoning_summary_text.delta",
-						"item_id": s.msgID,
-						"output_index": 0,
+						"type":          "response.reasoning_summary_text.delta",
+						"item_id":       s.msgID,
+						"output_index":  0,
 						"content_index": 0,
-						"delta": r,
+						"delta":         r,
 					})
 				}
-				// 工具调用
+				// 工具调用：按 tool_calls[].index 分别累积 id/call_id/name/arguments，
+				// 支持多调用与交错参数分片；各调用的 added/delta/done 必须对应正确调用。
 				if tc, ok := delta["tool_calls"].([]any); ok {
 					for _, c := range tc {
 						cm, ok := c.(map[string]any)
 						if !ok {
 							continue
 						}
-						if id, ok := cm["id"].(string); ok && id != "" {
-							curCallID = id
+						idx := 0
+						if f, ok := cm["index"].(float64); ok {
+							idx = int(f)
 						}
+						st, ok := toolByIndex[idx]
+						if !ok {
+							st = &respToolCall{idx: idx, outputIndex: 1 + len(toolOrder)}
+							toolByIndex[idx] = st
+							toolOrder = append(toolOrder, st)
+						}
+						if id, ok := cm["id"].(string); ok && id != "" {
+							st.callID = id
+						}
+						var frag string
 						fn, _ := cm["function"].(map[string]any)
 						if fn != nil {
 							if n, ok := fn["name"].(string); ok && n != "" {
-								curCallName = n
+								st.name = n
 							}
 							if a, ok := fn["arguments"].(string); ok && a != "" {
-								curArgs.WriteString(a)
+								frag = a
+								st.args.WriteString(a)
 							}
 						}
-						if !callEmitted && curCallName != "" {
-							callEmitted = true
+						if !st.added && st.name != "" {
+							st.added = true
+							fcID := respFCID(st)
 							s.event("response.output_item.added", map[string]any{
-								"type": "response.output_item.added",
-								"output_index": 1,
+								"type":         "response.output_item.added",
+								"output_index": st.outputIndex,
 								"item": map[string]any{
-									"type": "function_call",
-									"id":   "fc_" + curCallName,
-									"call_id": curCallID,
-									"name": curCallName,
+									"type":      "function_call",
+									"id":        fcID,
+									"call_id":   st.callID,
+									"name":      st.name,
 									"arguments": "",
-									"status": "in_progress",
+									"status":    "in_progress",
 								},
+							})
+						}
+						if frag != "" && st.added {
+							s.event("response.function_call_arguments.delta", map[string]any{
+								"type":         "response.function_call_arguments.delta",
+								"item_id":      respFCID(st),
+								"output_index": st.outputIndex,
+								"delta":        frag,
 							})
 						}
 					}
@@ -408,9 +459,51 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 		s.event("response.content_part.done", map[string]any{"type": "response.content_part.done", "item_id": s.msgID, "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": outText.String(), "annotations": []any{}}})
 		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 0, "item": map[string]any{"id": s.msgID, "type": "message", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": outText.String(), "annotations": []any{}}}}})
 	}
-	if callEmitted {
-		s.event("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "item_id": "fc_" + curCallName, "output_index": 1, "arguments": curArgs.String()})
-		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 1, "item": map[string]any{"type": "function_call", "id": "fc_" + curCallName, "call_id": curCallID, "name": curCallName, "arguments": curArgs.String(), "status": "completed"}})
+	for _, st := range toolOrder {
+		if !st.added {
+			st.added = true
+			fcID := respFCID(st)
+			s.event("response.output_item.added", map[string]any{
+				"type":         "response.output_item.added",
+				"output_index": st.outputIndex,
+				"item": map[string]any{
+					"type":      "function_call",
+					"id":        fcID,
+					"call_id":   st.callID,
+					"name":      st.name,
+					"arguments": "",
+					"status":    "in_progress",
+				},
+			})
+		}
+		fcID := respFCID(st)
+		s.event("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "item_id": fcID, "output_index": st.outputIndex, "arguments": st.args.String()})
+		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": st.outputIndex, "item": map[string]any{"type": "function_call", "id": fcID, "call_id": st.callID, "name": st.name, "arguments": st.args.String(), "status": "completed"}})
+	}
+	// 回填本次累积的 output：始终先放一个 message（空文本时 content 可为空、output_text 为 ""），
+	// 然后按上游顺序附加 function_call outputs，与非流式 chatToResponses 结构对齐。
+	outputs := []any{}
+	textContent := []any{}
+	if outText.String() != "" {
+		textContent = append(textContent, map[string]any{"type": "output_text", "text": outText.String(), "annotations": []any{}})
+	}
+	outputs = append(outputs, map[string]any{
+		"type":        "message",
+		"id":          s.msgID,
+		"status":      "completed",
+		"role":        "assistant",
+		"content":     textContent,
+		"output_text": outText.String(),
+	})
+	for _, st := range toolOrder {
+		outputs = append(outputs, map[string]any{
+			"type":      "function_call",
+			"id":        respFCID(st),
+			"call_id":   st.callID,
+			"name":      st.name,
+			"arguments": st.args.String(),
+			"status":    "completed",
+		})
 	}
 	s.event("response.completed", map[string]any{
 		"type": "response.completed",
@@ -420,7 +513,7 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 			"created_at":  time.Now().Unix(),
 			"status":      "completed",
 			"model":       model,
-			"output":      []any{},
+			"output":      outputs,
 			"output_text": outText.String(),
 			"usage":       map[string]any{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
 		},

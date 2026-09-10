@@ -1,10 +1,10 @@
 package app
 
 import (
-	"cline-go-proxy/internal/cline"
-	"cline-go-proxy/internal/kit"
 	"bufio"
 	"bytes"
+	"cline-go-proxy/internal/cline"
+	"cline-go-proxy/internal/kit"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -651,6 +651,76 @@ func getMsgCount(params map[string]any) int {
 	return 0
 }
 
+// streamDeltaFromChoice 从上游 choice 提取客户端可消费的 delta。
+// 兼容三种形状：标准 delta；choices[0].message 承载 content/tool_calls；
+// choice 本体直接承载 content/tool_calls。只读，不修改入参。
+func streamDeltaFromChoice(choice map[string]any) map[string]any {
+	if choice == nil {
+		return nil
+	}
+	if d, ok := choice["delta"].(map[string]any); ok && d != nil {
+		hasPayload := false
+		for _, k := range []string{"content", "tool_calls", "reasoning_content", "function_call", "role"} {
+			if v, ok := d[k]; ok && v != nil {
+				if s, ok := v.(string); ok && s == "" && k == "content" {
+					continue
+				}
+				if arr, ok := v.([]any); ok && len(arr) == 0 {
+					continue
+				}
+				hasPayload = true
+				break
+			}
+		}
+		if hasPayload {
+			return d
+		}
+	}
+	if msg, ok := choice["message"].(map[string]any); ok && msg != nil {
+		delta := make(map[string]any, 4)
+		for _, k := range []string{"content", "tool_calls", "reasoning_content", "function_call", "role"} {
+			if v, ok := msg[k]; ok {
+				delta[k] = v
+			}
+		}
+		if len(delta) > 0 {
+			return delta
+		}
+	}
+	delta := make(map[string]any, 4)
+	for _, k := range []string{"content", "tool_calls", "reasoning_content", "function_call", "role"} {
+		if v, ok := choice[k]; ok {
+			delta[k] = v
+		}
+	}
+	if len(delta) > 0 {
+		return delta
+	}
+	if d, ok := choice["delta"].(map[string]any); ok && d != nil {
+		return d
+	}
+	return choice
+}
+
+// normalizeStreamChunkChoices 将 chunk 内 choices[0] 规范成含 delta 的形状，
+// 使 message 或 choice 本体承载 content/tool_calls 的上游也能被客户端消费。
+// 直接修改传入 obj 并返回它。
+func normalizeStreamChunkChoices(obj map[string]any) map[string]any {
+	choices, _ := obj["choices"].([]any)
+	if len(choices) == 0 {
+		return obj
+	}
+	choice, _ := choices[0].(map[string]any)
+	if choice == nil {
+		return obj
+	}
+	delta := streamDeltaFromChoice(choice)
+	if delta != nil {
+		choice["delta"] = delta
+	}
+	return obj
+}
+
 func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -664,59 +734,128 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 		return
 	}
 
+	sentDone := false
+	emitDoneWithExtras := func(extras []string) {
+		if sentDone {
+			return
+		}
+		sentDone = true
+		if len(extras) > 0 {
+			w.Write([]byte(strings.Join(extras, "\n") + "\ndata: [DONE]\n\n"))
+		} else {
+			w.Write([]byte("data: [DONE]\n\n"))
+		}
+		flusher.Flush()
+	}
+	emitDone := func() {
+		emitDoneWithExtras(nil)
+	}
+
+	// flushEvent 按“空行结束的完整 SSE event”处理一批已缓存行。
+	// 保留 event/id/retry/comment 等非 data 字段及其事件关联；
+	// data 行按 SSE 规则剥首空格后以换行连接为完整 payload 再做归一化。
+	flushEvent := func(lines []string) {
+		if len(lines) == 0 {
+			return
+		}
+		var extras []string
+		var dataPayloads []string
+		for _, ln := range lines {
+			ls := strings.TrimLeft(ln, " \t")
+			if strings.HasPrefix(strings.TrimSpace(ln), ":") {
+				extras = append(extras, ln)
+				continue
+			}
+			if strings.HasPrefix(ls, "data:") {
+				p := ls[len("data:"):]
+				if strings.HasPrefix(p, " ") {
+					p = p[1:]
+				}
+				dataPayloads = append(dataPayloads, p)
+				continue
+			}
+			extras = append(extras, ln)
+		}
+		// 无 data 的纯注释/心跳/event-only 事件：原样转发完整帧。
+		if len(dataPayloads) == 0 {
+			w.Write([]byte(strings.Join(lines, "\n") + "\n\n"))
+			flusher.Flush()
+			return
+		}
+		joined := strings.Join(dataPayloads, "\n")
+		if strings.TrimSpace(joined) == "[DONE]" {
+			emitDoneWithExtras(extras)
+			return
+		}
+		if strings.TrimSpace(joined) == "" {
+			if len(extras) > 0 {
+				w.Write([]byte(strings.Join(extras, "\n") + "\ndata:\n\n"))
+			} else {
+				w.Write([]byte("data:\n\n"))
+			}
+			flusher.Flush()
+			return
+		}
+		// Try to normalize the response
+		var obj map[string]any
+		if jerr := json.Unmarshal([]byte(joined), &obj); jerr == nil {
+			if onUsage != nil {
+				if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
+					onUsage(u)
+				}
+			}
+			// Some Cline responses wrap in {data: {...}}
+			if data, ok := obj["data"]; ok {
+				if d, ok := data.(map[string]any); ok {
+					if _, hasChoices := d["choices"]; hasChoices {
+						obj = d
+					}
+					if _, hasID := d["id"]; hasID {
+						obj = d
+					}
+				}
+			}
+			obj = normalizeStreamChunkChoices(obj)
+			normalized := normalizeOpenAIResponse(obj)
+			if normBytes, merr := json.Marshal(normalized); merr == nil {
+				if len(extras) > 0 {
+					w.Write([]byte(strings.Join(extras, "\n") + "\ndata: " + string(normBytes) + "\n\n"))
+				} else {
+					w.Write([]byte("data: " + string(normBytes) + "\n\n"))
+				}
+				flusher.Flush()
+				return
+			}
+		}
+		// 非 JSON 的 data 事件：原样补成完整帧透传，不误当 JSON。
+		w.Write([]byte(strings.Join(lines, "\n") + "\n\n"))
+		flusher.Flush()
+	}
+
 	reader := bufio.NewReader(upstream.Body)
+	var cur []string
 	for {
 		line, err := reader.ReadString('\n')
+		if line != "" {
+			noNL := strings.TrimRight(line, "\r\n")
+			if strings.TrimSpace(noNL) == "" {
+				flushEvent(cur)
+				cur = nil
+			} else {
+				cur = append(cur, noNL)
+			}
+		}
 		if err != nil {
-			if err == io.EOF {
-				if line != "" {
-					w.Write([]byte(line + "\n"))
-				}
+			// EOF 时处理尚未闭合事件。
+			if len(cur) > 0 {
+				flushEvent(cur)
+				cur = nil
 			}
 			break
 		}
-
-		line = strings.TrimRight(line, "\r\n")
-
-		if strings.HasPrefix(line, "data:") {
-			payload := strings.TrimSpace(line[5:])
-			if payload == "" || payload == "[DONE]" {
-				w.Write([]byte(line + "\n\n"))
-				flusher.Flush()
-				continue
-			}
-
-			// Try to normalize the response
-			var obj map[string]any
-			if err := json.Unmarshal([]byte(payload), &obj); err == nil {
-				if onUsage != nil {
-					if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
-						onUsage(u)
-					}
-				}
-				// Some Cline responses wrap in {data: {...}}
-				if data, ok := obj["data"]; ok {
-					if d, ok := data.(map[string]any); ok {
-						if _, hasChoices := d["choices"]; hasChoices {
-							obj = d
-						}
-						if _, hasID := d["id"]; hasID {
-							obj = d
-						}
-					}
-				}
-				normalized := normalizeOpenAIResponse(obj)
-				if normBytes, err := json.Marshal(normalized); err == nil {
-					w.Write([]byte("data: " + string(normBytes) + "\n\n"))
-					flusher.Flush()
-					continue
-				}
-			}
-		}
-
-		w.Write([]byte(line + "\n"))
-		flusher.Flush()
 	}
+	// 上游 EOF 前没有 [DONE] 时补一个且只补一次。
+	emitDone()
 }
 
 func handleNonStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) {
@@ -808,10 +947,7 @@ func collectStreamResponse(upstream *http.Response) (map[string]any, error) {
 			if choice == nil {
 				continue
 			}
-			delta, _ := choice["delta"].(map[string]any)
-			if delta == nil {
-				delta = choice
-			}
+			delta := streamDeltaFromChoice(choice)
 			if fr, ok := choice["finish_reason"].(string); ok && fr != "" {
 				finishReason = fr
 			}
@@ -1716,10 +1852,7 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 			return
 		}
 
-		delta, ok := choice["delta"].(map[string]any)
-		if !ok {
-			delta = choice
-		}
+		delta := streamDeltaFromChoice(choice)
 
 		if c, ok := delta["content"].(string); ok && c != "" {
 			if !hasText {
