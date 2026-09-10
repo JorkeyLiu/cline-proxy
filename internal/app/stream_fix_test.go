@@ -362,18 +362,11 @@ func TestResponsesEmptyStillHasMessage(t *testing.T) {
 	chatStreamToResponses(rec, up, nil)
 	completed := completedOf(t, rec.Body.String())
 	outputs, _ := completed["output"].([]any)
-	if len(outputs) != 1 {
-		t.Fatalf("empty should have exactly 1 message output, got %d: %v", len(outputs), completed["output"])
-	}
-	msg, _ := outputs[0].(map[string]any)
-	if msg["type"] != "message" {
-		t.Fatalf("first output should be message: %v", msg)
+	if len(outputs) != 0 {
+		t.Fatalf("empty should have 0 outputs (no fake message), got %d: %v", len(outputs), completed["output"])
 	}
 	if ot, _ := completed["output_text"].(string); ot != "" {
 		t.Fatalf("empty output_text should be \"\", got %q", ot)
-	}
-	if c, _ := msg["content"].([]any); len(c) != 0 {
-		t.Fatalf("empty message content should be empty, got %v", c)
 	}
 }
 
@@ -383,17 +376,34 @@ func TestResponsesToolOnlyStillHasMessage(t *testing.T) {
 	chatStreamToResponses(rec, up, nil)
 	completed := completedOf(t, rec.Body.String())
 	outputs, _ := completed["output"].([]any)
-	if len(outputs) != 2 {
-		t.Fatalf("tool-only should have message + 1 function_call, got %d: %v", len(outputs), completed["output"])
+	if len(outputs) != 1 {
+		t.Fatalf("tool-only should have 1 function_call at index 0 (no fake message), got %d: %v", len(outputs), completed["output"])
 	}
-	msg, _ := outputs[0].(map[string]any)
-	if msg["type"] != "message" {
-		t.Fatalf("first output should be message: %v", msg)
-	}
-	fc, _ := outputs[1].(map[string]any)
+	fc, _ := outputs[0].(map[string]any)
 	if fc["type"] != "function_call" || fc["name"] != "get_weather" {
-		t.Fatalf("second output should be function_call get_weather: %v", fc)
+		t.Fatalf("single output should be function_call get_weather: %v", fc)
 	}
+	if idx := getOutputIndex(t, rec.Body.String(), fc["id"].(string)); idx != 0 {
+		t.Fatalf("tool-only first index should be 0, got %d", idx)
+	}
+}
+
+// helper to find output_index for a given item id from SSE
+func getOutputIndex(t *testing.T, raw string, itemID string) int {
+	t.Helper()
+	evs := parseResponsesEvents(t, raw)
+	for _, e := range evs {
+		if e.event == "response.output_item.added" {
+			if item, ok := e.data["item"].(map[string]any); ok {
+				if id, _ := item["id"].(string); id == itemID {
+					if oi, ok := e.data["output_index"].(float64); ok {
+						return int(oi)
+					}
+				}
+			}
+		}
+	}
+	return -1
 }
 
 func TestResponsesToolCallDeltaStandard(t *testing.T) {
@@ -416,8 +426,11 @@ func TestResponsesToolCallDeltaStandard(t *testing.T) {
 	}
 	completed := completedOf(t, body)
 	outputs, _ := completed["output"].([]any)
-	if len(outputs) != 2 {
-		t.Fatalf("expected message + 1 call, got %v", completed["output"])
+	if len(outputs) != 1 {
+		t.Fatalf("expected 1 call (no fake message), got %v", completed["output"])
+	}
+	if fc, _ := outputs[0].(map[string]any); fc["type"] != "function_call" {
+		t.Fatalf("expected function_call, got %v", outputs[0])
 	}
 }
 
@@ -433,14 +446,15 @@ func TestResponsesTwoInterleavedToolCalls(t *testing.T) {
 	events := parseResponsesEvents(t, body)
 	completed := completedOf(t, body)
 	outputs, _ := completed["output"].([]any)
-	if len(outputs) != 3 {
-		t.Fatalf("expected message + 2 function_calls, got %d: %v", len(outputs), completed["output"])
+	if len(outputs) != 2 {
+		t.Fatalf("expected 2 function_calls (no fake message), got %d: %v", len(outputs), completed["output"])
 	}
-	if m, _ := outputs[0].(map[string]any); m["type"] != "message" {
-		t.Fatalf("output[0] should be message: %v", outputs[0])
+	fcA, _ := outputs[0].(map[string]any)
+	fcB, _ := outputs[1].(map[string]any)
+	if fcA["type"] != "function_call" || fcB["type"] != "function_call" {
+		t.Fatalf("outputs should both be function_call: %v %v", fcA, fcB)
 	}
-	fcA, _ := outputs[1].(map[string]any)
-	fcB, _ := outputs[2].(map[string]any)
+	// order by output_index should preserve creation order (0->funcA,1->funcB)
 	if fcA["name"] != "funcA" || fcB["name"] != "funcB" {
 		t.Fatalf("function order/names wrong: %v %v", fcA, fcB)
 	}
@@ -456,7 +470,7 @@ func TestResponsesTwoInterleavedToolCalls(t *testing.T) {
 	if c, _ := fcB["call_id"].(string); c != "call_B" {
 		t.Fatalf("funcB call_id wrong: %q", c)
 	}
-	// added/delta/done 必须对应正确调用、不能合并
+	// added/delta/done 必须对应正确调用、不能合并, now indices 0 and 1
 	addedIdx := map[float64]int{}
 	deltaIdx := map[float64]int{}
 	doneIdx := map[float64]int{}
@@ -475,13 +489,13 @@ func TestResponsesTwoInterleavedToolCalls(t *testing.T) {
 			doneIdx[oi]++
 		}
 	}
-	if addedIdx[1] != 1 || addedIdx[2] != 1 {
-		t.Fatalf("added should be one per call (idx1, idx2): %v", addedIdx)
+	if addedIdx[0] != 1 || addedIdx[1] != 1 {
+		t.Fatalf("added should be one per call (idx0, idx1): %v", addedIdx)
 	}
-	if len(deltaIdx) != 2 || deltaIdx[1] == 0 || deltaIdx[2] == 0 {
+	if len(deltaIdx) != 2 || deltaIdx[0] == 0 || deltaIdx[1] == 0 {
 		t.Fatalf("delta should exist for both calls separately: %v", deltaIdx)
 	}
-	if doneIdx[1] != 1 || doneIdx[2] != 1 {
+	if doneIdx[0] != 1 || doneIdx[1] != 1 {
 		t.Fatalf("done should be one per call: %v", doneIdx)
 	}
 }

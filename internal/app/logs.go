@@ -47,18 +47,19 @@ func AppendReqLog(l RequestLog) {
 		reqLogs = reqLogs[len(reqLogs)-maxReqLogs:]
 	}
 	reqLogsMu.Unlock()
-	go func() {
+	path := reqLogsFile
+	go func(p string) {
 		data, _ := json.Marshal(l)
-		f, err := os.OpenFile(reqLogsFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 		if err != nil {
 			return
 		}
 		f.Write(append(data, '\n'))
 		f.Close()
-		if st, err := os.Stat(reqLogsFile); err == nil && st.Size() > maxReqLogsFile {
-			os.WriteFile(reqLogsFile, nil, 0600)
+		if st, err := os.Stat(p); err == nil && st.Size() > maxReqLogsFile {
+			os.WriteFile(p, nil, 0600)
 		}
-	}()
+	}(path)
 }
 
 // LoadRequestLogs 返回最近的请求日志（内存优先，启动后从落盘文件补载）

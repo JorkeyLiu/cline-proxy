@@ -1,8 +1,8 @@
 package app
 
 import (
-	"cline-go-proxy/internal/kit"
 	"bytes"
+	"cline-go-proxy/internal/kit"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -354,9 +354,7 @@ func buildZenBody(params map[string]any, stream bool) map[string]any {
 			body[key] = val
 		}
 	}
-	if stream {
-		body["stream"] = true
-	}
+	body["stream"] = stream
 	if model, ok := params["model"].(string); ok {
 		if m, ok := resolveZenModel(model); ok {
 			body["model"] = m.ID

@@ -104,42 +104,7 @@ func StartProxy(host string, port int) error {
 	// Admin API (frontend + REST)
 	registerAdminRoutes(mux)
 
-	apiKeyHandler := func(next http.HandlerFunc) http.HandlerFunc {
-		return corsHandler(func(w http.ResponseWriter, r *http.Request) {
-			// Allow requests without key if no keys configured
-			p := loadPool()
-			if len(p.Keys) == 0 {
-				next(w, r)
-				return
-			}
-
-			key := r.Header.Get("x-api-key")
-			if key == "" {
-				if b := r.Header.Get("Authorization"); len(b) > 7 && b[:7] == "Bearer " {
-					key = b[7:]
-				}
-			}
-
-			valid := false
-			for _, k := range p.Keys {
-				if k == key {
-					valid = true
-					break
-				}
-			}
-
-			if !valid {
-				writeJSON(w, http.StatusUnauthorized, map[string]any{
-					"error": map[string]string{
-						"message": "invalid API key. Generate one at /admin/ or set x-api-key header",
-						"type":    "auth_error",
-					},
-				})
-				return
-			}
-			next(w, r)
-		})
-	}
+	apiKeyHandler := apiKeyMiddleware
 
 	modelsHandler := apiKeyHandler(func(w http.ResponseWriter, r *http.Request) {
 		ensureModelsFresh()
@@ -654,13 +619,14 @@ func getMsgCount(params map[string]any) int {
 // streamDeltaFromChoice 从上游 choice 提取客户端可消费的 delta。
 // 兼容三种形状：标准 delta；choices[0].message 承载 content/tool_calls；
 // choice 本体直接承载 content/tool_calls。只读，不修改入参。
+// 注意：Responses 专用的 reasoning / reasoning_content 由 responsesDeltaFromChoice 单独处理，Chat 不输出推理别名。
 func streamDeltaFromChoice(choice map[string]any) map[string]any {
 	if choice == nil {
 		return nil
 	}
 	if d, ok := choice["delta"].(map[string]any); ok && d != nil {
 		hasPayload := false
-		for _, k := range []string{"content", "tool_calls", "reasoning_content", "function_call", "role"} {
+		for _, k := range []string{"content", "tool_calls", "function_call", "role"} {
 			if v, ok := d[k]; ok && v != nil {
 				if s, ok := v.(string); ok && s == "" && k == "content" {
 					continue
@@ -673,12 +639,21 @@ func streamDeltaFromChoice(choice map[string]any) map[string]any {
 			}
 		}
 		if hasPayload {
-			return d
+			filtered := make(map[string]any, 4)
+			for _, k := range []string{"content", "tool_calls", "function_call", "role"} {
+				if v, ok := d[k]; ok {
+					filtered[k] = v
+				}
+			}
+			if len(filtered) > 0 {
+				return filtered
+			}
+			return nil
 		}
 	}
 	if msg, ok := choice["message"].(map[string]any); ok && msg != nil {
 		delta := make(map[string]any, 4)
-		for _, k := range []string{"content", "tool_calls", "reasoning_content", "function_call", "role"} {
+		for _, k := range []string{"content", "tool_calls", "function_call", "role"} {
 			if v, ok := msg[k]; ok {
 				delta[k] = v
 			}
@@ -688,7 +663,7 @@ func streamDeltaFromChoice(choice map[string]any) map[string]any {
 		}
 	}
 	delta := make(map[string]any, 4)
-	for _, k := range []string{"content", "tool_calls", "reasoning_content", "function_call", "role"} {
+	for _, k := range []string{"content", "tool_calls", "function_call", "role"} {
 		if v, ok := choice[k]; ok {
 			delta[k] = v
 		}
@@ -696,10 +671,7 @@ func streamDeltaFromChoice(choice map[string]any) map[string]any {
 	if len(delta) > 0 {
 		return delta
 	}
-	if d, ok := choice["delta"].(map[string]any); ok && d != nil {
-		return d
-	}
-	return choice
+	return nil
 }
 
 // normalizeStreamChunkChoices 将 chunk 内 choices[0] 规范成含 delta 的形状，
@@ -2173,4 +2145,40 @@ func parseIntSafe(s string) (int, error) {
 		n = n*10 + int(s[i]-'0')
 	}
 	return n, nil
+}
+
+// apiKeyMiddleware 是 StartProxy 与测试共用的 API key 鉴权中间件。
+// 语义与 StartProxy 原局部闭包完全一致：无 Keys 时放行；否则校验 x-api-key 或 Authorization: Bearer <key>；
+// 失败返回 401 auth_error，成功继续。管理台路由不经此中间件。
+func apiKeyMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return corsHandler(func(w http.ResponseWriter, r *http.Request) {
+		p := loadPool()
+		if len(p.Keys) == 0 {
+			next(w, r)
+			return
+		}
+		key := r.Header.Get("x-api-key")
+		if key == "" {
+			if b := r.Header.Get("Authorization"); len(b) > 7 && b[:7] == "Bearer " {
+				key = b[7:]
+			}
+		}
+		valid := false
+		for _, k := range p.Keys {
+			if k == key {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"error": map[string]string{
+					"message": "invalid API key. Generate one at /admin/ or set x-api-key header",
+					"type":    "auth_error",
+				},
+			})
+			return
+		}
+		next(w, r)
+	})
 }
