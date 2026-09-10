@@ -728,9 +728,9 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(http.StatusOK)
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		log.Printf("  streaming not supported for client")
+	rc := http.NewResponseController(w)
+	if err := rc.Flush(); err != nil {
+		log.Printf("  streaming not supported for client: %v", err)
 		return
 	}
 
@@ -745,7 +745,7 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 		} else {
 			w.Write([]byte("data: [DONE]\n\n"))
 		}
-		flusher.Flush()
+		_ = rc.Flush()
 	}
 	emitDone := func() {
 		emitDoneWithExtras(nil)
@@ -779,7 +779,7 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 		// 无 data 的纯注释/心跳/event-only 事件：原样转发完整帧。
 		if len(dataPayloads) == 0 {
 			w.Write([]byte(strings.Join(lines, "\n") + "\n\n"))
-			flusher.Flush()
+			_ = rc.Flush()
 			return
 		}
 		joined := strings.Join(dataPayloads, "\n")
@@ -793,7 +793,7 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 			} else {
 				w.Write([]byte("data:\n\n"))
 			}
-			flusher.Flush()
+			_ = rc.Flush()
 			return
 		}
 		// Try to normalize the response
@@ -823,13 +823,13 @@ func handleStreamResponseWithUsage(w http.ResponseWriter, upstream *http.Respons
 				} else {
 					w.Write([]byte("data: " + string(normBytes) + "\n\n"))
 				}
-				flusher.Flush()
+				_ = rc.Flush()
 				return
 			}
 		}
 		// 非 JSON 的 data 事件：原样补成完整帧透传，不误当 JSON。
 		w.Write([]byte(strings.Join(lines, "\n") + "\n\n"))
-		flusher.Flush()
+		_ = rc.Flush()
 	}
 
 	reader := bufio.NewReader(upstream.Body)
@@ -1711,8 +1711,9 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(http.StatusOK)
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	rc := http.NewResponseController(w)
+	if err := rc.Flush(); err != nil {
+		log.Printf("  anthropic streaming not supported: %v", err)
 		return
 	}
 
@@ -1733,7 +1734,7 @@ func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Respon
 		if streamLog != nil {
 			streamLog.WriteString(line)
 		}
-		flusher.Flush()
+		_ = rc.Flush()
 	}
 
 	msgID := "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli())

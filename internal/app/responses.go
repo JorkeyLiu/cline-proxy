@@ -252,23 +252,21 @@ func chatToResponses(chat map[string]any) map[string]any {
 // ============ 流式响应转换 (Responses SSE) ============
 
 type responsesSSEWriter struct {
-	w       http.ResponseWriter
-	flusher http.Flusher
-	msgID   string
-	respID  string
+	w      http.ResponseWriter
+	rc     *http.ResponseController
+	msgID  string
+	respID string
 }
 
 func newResponsesSSE(w http.ResponseWriter) *responsesSSEWriter {
-	f, _ := w.(http.Flusher)
-	return &responsesSSEWriter{w: w, flusher: f, msgID: "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli()), respID: "resp_" + fmt.Sprintf("%x", time.Now().UnixMilli())}
+	rc := http.NewResponseController(w)
+	return &responsesSSEWriter{w: w, rc: rc, msgID: "msg_" + fmt.Sprintf("%x", time.Now().UnixMilli()), respID: "resp_" + fmt.Sprintf("%x", time.Now().UnixMilli())}
 }
 
 func (s *responsesSSEWriter) event(event string, data any) {
 	b, _ := json.Marshal(data)
 	fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", event, string(b))
-	if s.flusher != nil {
-		s.flusher.Flush()
-	}
+	_ = s.rc.Flush()
 }
 
 // chatStreamToResponses 将上游 chat.completions SSE 流转换为 Responses SSE 流
