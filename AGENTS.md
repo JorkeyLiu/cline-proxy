@@ -26,7 +26,7 @@ Go 实现的统一反向代理。对外同时兼容 OpenAI Chat、OpenAI Respons
 - Zen 配置持久化：经 `kit.ResolveDataPath` 定位的 `.zen-config.json`。
 - 系统提示词覆盖开关：工作目录直接读取的 `override.md`，不存在即使用客户端自带，不做额外查找或回退决策。
 - 模块依赖：`go.mod` / `go.sum`。
-- 构建 / 部署 / 发布：`Dockerfile`、`docker-compose.yml`、`.github/workflows/build.yml`。发布版本号递增逻辑由该 workflow 管理。
+- 构建 / 部署 / 发布：`Dockerfile`、`docker-compose.yml`、`.github/workflows/docker.yml`。镜像 tag 规则由该 workflow 管理：`sha-<short>` 是不可变回滚锚点，滚动 `dev` 始终指向主线最新构建；部署侧默认用 `dev` 拉取最新，回滚时改用具体 `sha-<short>`。
 
 以下只是投影或瞬态状态，不得当作权威配置读取或提交：
 
@@ -56,12 +56,12 @@ Go 实现的统一反向代理。对外同时兼容 OpenAI Chat、OpenAI Respons
 
 ## 验证门禁
 
-当前仓库无测试文件，无 lint / format / typecheck 门禁。以下为代码任务的最低完成标准，针对最终工作树执行并保留原始退出码：
+仓库存在聚焦测试（如 `internal/app/stream_fix_test.go`），无独立 lint / format / typecheck 门禁。以下为代码任务的最低完成标准，针对最终工作树执行并保留原始退出码：
 
 - `gofmt` 对改动 Go 文件无差异。
 - `go vet ./...` 通过。
 - `CGO_ENABLED=0 go build -ldflags="-s -w" .` 通过。
-- 新增或修改可测试行为时，补聚焦测试并运行 `go test ./...`。
+- 修改可测试行为时补聚焦测试；仓库存在测试，必须运行 `go test ./...` 并保持通过。
 
 协议转换、流式响应、管理台交互等行为，仅靠静态检查或编译通过不足以证明；需要实际请求或运行时 UI 观察作为证据。
 
@@ -69,7 +69,7 @@ Go 实现的统一反向代理。对外同时兼容 OpenAI Chat、OpenAI Respons
 
 ## Git 与发布
 
-未经用户明确要求，不得 commit、amend、push、force-push、创建 PR、打 tag、发布；不得丢弃用户已有改动。发布逻辑由 workflow 拥有，代理实现侧不得另立版本规则。
+未经用户明确要求，不得 commit、amend、push、force-push、创建 PR、打 tag、发布；不得丢弃用户已有改动。唯一主线为 `jorkey/integration`，`main` 已弃用、不再触发构建或发布。镜像发布逻辑由 `.github/workflows/docker.yml` 拥有，代理实现侧不得另立镜像 tag 规则。
 
 ## 范围与风格
 
@@ -83,6 +83,7 @@ Go 实现的统一反向代理。对外同时兼容 OpenAI Chat、OpenAI Respons
 - [go.mod](go.mod)：模块依赖权威。
 - [Dockerfile](Dockerfile)：构建权威。
 - [docker-compose.yml](docker-compose.yml)：部署权威。
-- [.github/workflows/build.yml](.github/workflows/build.yml)：构建与发布权威。
+- [.github/workflows/docker.yml](.github/workflows/docker.yml)：镜像构建与发布权威（`sha-<short>` + 滚动 `dev`，GHCR public，linux/arm64）。
+- [.dockerignore](.dockerignore)：构建上下文边界（确保数据/密钥不进入镜像构建）。
 - [.gitignore](.gitignore)：敏感状态保护边界。
 - [internal/kit/data.go](internal/kit/data.go)：数据路径解析权威。

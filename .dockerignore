@@ -1,0 +1,29 @@
+# VCS / CI
+.git
+.github
+
+# Build output
+dist/
+cline-proxy
+cline-proxy.exe
+cline-proxy-*
+*.test
+*.out
+
+# Local data / secrets (never enter build context)
+data/
+.cline-accounts.json
+.cline-credentials.json
+.zen-config.json
+*.jsonl
+cline-proxy.log
+cline-proxy-stream.log
+override.md
+
+# Local debug tooling
+capture.go
+capture-logs/
+
+# Docs
+README.md
+AGENTS.md

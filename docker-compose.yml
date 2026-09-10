@@ -1,14 +1,19 @@
-version: "3.9"
-
 services:
   cline-proxy:
-    build: .
+    image: ghcr.io/jorkeyliu/cline-proxy:dev
     container_name: cline-proxy
     restart: unless-stopped
+    pull_policy: always
     ports:
       - "3457:3457"
     volumes:
       - ./data:/app/data
-      - ./override.md:/app/override.md:ro
+      # 需要 system prompt 覆盖时，先确保 ./override.md 存在再取消注释（Chat/Anthropic 生效，Responses 不生效）
+      # - ./override.md:/app/override.md:ro
     environment:
-      - PORT=3457
+      - TZ=Asia/Shanghai
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3457/admin/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
